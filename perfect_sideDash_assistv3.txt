@@ -1,0 +1,836 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+
+local LP = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local enabled = true
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "DashToggleGui"
+sg.ResetOnSpawn = false
+sg.IgnoreGuiInset = true
+sg.Parent = LP:WaitForChild("PlayerGui")
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(0, 110, 0, 34)
+btn.Position = UDim2.new(0, 10, 0, 10)
+btn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 15
+btn.Text = "Dash: ON"
+btn.BorderSizePixel = 0
+btn.Parent = sg
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+btn.MouseButton1Click:Connect(function()
+	enabled = not enabled
+	if enabled then
+		btn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
+		btn.Text = "Dash: ON"
+	else
+		btn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+		btn.Text = "Dash: OFF"
+	end
+end)
+
+local REACH = 0
+local AUTO_DIST = 50
+
+local BASE_SPEED = 120
+local CLOSE_SPEED = 130
+local CLOSE_DIST = 15
+
+local DURATION = 0.23
+local FAR_DURATION = 0.29
+local CLOSE_DURATION = 0.23
+
+local POST_LOOK = 0.32
+
+local BASE_PREDICT = 0.155
+local SIDE_BOOST = 0.1
+
+local CAMERA_SMOOTH = 0.091
+
+local TOTAL_MAX_DISTANCE = 26
+local DASH_DISTANCE = 10
+
+local HARD_SPEED_CAP = 130
+local SOFT_BRAKE_MARGIN = 5.5
+
+local SMOOTH_STOP_RATE = 45
+
+local FAR_APPROACH_DIST = 20
+local FAR_SIDE_OFFSET = 5.8
+
+local ORBIT_DISTANCE = 26
+local ORBIT_FORCE = 2.5
+
+local HOVER_HEIGHT = 3.5
+local HOVER_PULL = 18
+local MAX_Y_VEL = 13
+local GRAVITY_STRENGTH = 28
+
+local SLIDE_MIN_SPEED = 45
+local SLIDE_STOP_SPEED = 1.5
+local SLIDE_ROTATE_FORCE = 0.98
+local SLIDE_SIDE_CURVE = 0.75
+local SLIDE_BRAKE = 65
+
+local CLICK_DISTANCE = 28
+local CLICK_DELAY = 0.17
+
+local VEL_HISTORY_SIZE = 10
+
+local ACCEL_PREDICT_SCALE = 0.085
+local JERK_ANGLE_THRESHOLD = 0.55
+local JERK_PREDICT_BOOST = 1.55
+local JERK_LERP_BOOST = 18
+
+local ANTI_LOSS_MIN_SPEED = 2.0
+
+local INERTIA_COMP_SCALE = 0.18
+
+local MICRO_CORR_JERK_OFFSET = 0.55
+
+local NEAR_LERP_BOOST = 32
+local FAR_LERP_BASE = 9
+
+local TEMPO_DECEL_THRESHOLD = 0.35
+local TEMPO_DECEL_PREDICT = 0.6
+
+local BACK_PREDICT_BOOST = 1.4
+
+local SIDE_DASH_ORBIT_BOOST = 1.35
+
+local HOOKDASH_STAB_ALPHA = 0.82
+
+local ANIM_LEFT  = "rbxassetid://10480793962"
+local ANIM_RIGHT = "rbxassetid://10480796021"
+
+local isDashing = false
+local debounce = false
+
+local currentAnimConnection
+local currentRotateConnection
+
+local activeTrack
+local activeDashId = 0
+
+local lastAnimTime = 0
+local lastAnimId = ""
+
+local velocityHistories = {}
+
+local function getPingAdaptive()
+	local rawMs = 0
+	pcall(function()
+		rawMs = Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	local level = math.clamp((rawMs - 75) / 25, 0, 4)
+	return {
+		pingSec     = math.clamp(rawMs / 1000, 0, 0.22),
+		clickDelay  = CLICK_DELAY * math.max(1 - level * 0.18, 0.25),
+		predictMult = 1 + level * 0.18,
+		orbitForce  = ORBIT_FORCE + level * 0.15,
+		sideBoost   = SIDE_BOOST + level * 0.04,
+	}
+end
+
+local function breakShiftLock()
+	pcall(function()
+		UIS.MouseBehavior = Enum.MouseBehavior.Default
+	end)
+end
+
+local function isDisabled(humanoid)
+	if not humanoid then return true end
+	local state = humanoid:GetState()
+	if state == Enum.HumanoidStateType.Ragdoll    then return true end
+	if state == Enum.HumanoidStateType.FallingDown then return true end
+	if state == Enum.HumanoidStateType.Physics     then return true end
+	if state == Enum.HumanoidStateType.Dead        then return true end
+	if humanoid.Health <= 0   then return true end
+	if humanoid.PlatformStand then return true end
+	if humanoid.Sit           then return true end
+	return false
+end
+
+local function pushVelocity(hrp, vel)
+	if not velocityHistories[hrp] then
+		velocityHistories[hrp] = {}
+	end
+	local hist = velocityHistories[hrp]
+	table.insert(hist, { vel = vel, t = tick() })
+	while #hist > VEL_HISTORY_SIZE do
+		table.remove(hist, 1)
+	end
+end
+
+local function getAcceleration(hrp)
+	local hist = velocityHistories[hrp]
+	if not hist or #hist < 2 then return Vector3.zero end
+	local newest = hist[#hist]
+	local oldest = hist[1]
+	local dt = newest.t - oldest.t
+	if dt < 0.001 then return Vector3.zero end
+	local dv = newest.vel - oldest.vel
+	return Vector3.new(dv.X / dt, 0, dv.Z / dt)
+end
+
+local function isJerkDetected(hrp)
+	local hist = velocityHistories[hrp]
+	if not hist or #hist < 2 then return false end
+	local prev = Vector3.new(hist[#hist-1].vel.X, 0, hist[#hist-1].vel.Z)
+	local curr = Vector3.new(hist[#hist].vel.X,   0, hist[#hist].vel.Z)
+	if prev.Magnitude < 1 or curr.Magnitude < 1 then return false end
+	return prev.Unit:Dot(curr.Unit) < JERK_ANGLE_THRESHOLD
+end
+
+local function isDecelDetected(hrp)
+	local hist = velocityHistories[hrp]
+	if not hist or #hist < 3 then return false end
+	local prev = hist[#hist-2].vel
+	local curr = hist[#hist].vel
+	local prevM = Vector3.new(prev.X, 0, prev.Z).Magnitude
+	local currM = Vector3.new(curr.X, 0, curr.Z).Magnitude
+	if prevM < 1 then return false end
+	return (currM / prevM) < TEMPO_DECEL_THRESHOLD
+end
+
+local function isBackDash(hrp, myHrp)
+	local hist = velocityHistories[hrp]
+	if not hist or #hist < 1 then return false end
+	local toTarget = hrp.Position - myHrp.Position
+	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flat.Magnitude < 0.1 then return false end
+	local vel = hist[#hist].vel
+	if vel.Magnitude < 2 then return false end
+	return flat.Unit:Dot(vel.Unit) > 0.45
+end
+
+local function isSideDash(hrp, myHrp)
+	local hist = velocityHistories[hrp]
+	if not hist or #hist < 1 then return false end
+	local toTarget = hrp.Position - myHrp.Position
+	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flat.Magnitude < 0.1 then return false end
+	local vel = hist[#hist].vel
+	if vel.Magnitude < 3 then return false end
+	local absDot = math.abs(flat.Unit:Dot(vel.Unit))
+	return absDot < 0.35
+end
+
+local function predictPosition(hrp, basePredictTime, myHrp)
+	local vel = hrp.AssemblyLinearVelocity
+	local flatV = Vector3.new(vel.X, 0, vel.Z)
+
+	pushVelocity(hrp, flatV)
+
+	local accel    = getAcceleration(hrp)
+	local jerk     = isJerkDetected(hrp)
+	local decel    = isDecelDetected(hrp)
+	local backDash = myHrp and isBackDash(hrp, myHrp)
+	local sideDash = myHrp and isSideDash(hrp, myHrp)
+
+	local predictT = basePredictTime
+
+	if jerk then
+		predictT = predictT * JERK_PREDICT_BOOST
+	end
+	if decel then
+		predictT = predictT * TEMPO_DECEL_PREDICT
+	end
+	if backDash then
+		predictT = predictT * BACK_PREDICT_BOOST
+	end
+
+	local predicted =
+		hrp.Position
+		+ flatV * predictT
+		+ accel * (ACCEL_PREDICT_SCALE * predictT * predictT)
+
+	if flatV.Magnitude < ANTI_LOSS_MIN_SPEED then
+		predicted = predicted:Lerp(hrp.Position, 0.7)
+	end
+
+	return Vector3.new(predicted.X, hrp.Position.Y, predicted.Z), jerk, sideDash, backDash
+end
+
+local function getNearest()
+	local char = LP.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local nearest, best = nil, AUTO_DIST
+	local pa   = getPingAdaptive()
+	local ping = pa.pingSec
+
+	for _, plr in pairs(Players:GetPlayers()) do
+		if plr ~= LP and plr.Character then
+			local ehrp = plr.Character:FindFirstChild("HumanoidRootPart")
+			local hum  = plr.Character:FindFirstChild("Humanoid")
+
+			if ehrp and hum and hum.Health > 0 then
+				local predicted, _ = predictPosition(ehrp, BASE_PREDICT * pa.predictMult + ping + 0.05, hrp)
+				local dist = (
+					Vector3.new(predicted.X, 0, predicted.Z)
+					- Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+				).Magnitude
+
+				if dist < best then
+					best    = dist
+					nearest = ehrp
+				end
+			end
+		end
+	end
+
+	if workspace:FindFirstChild("Live") then
+		local dummy = workspace.Live:FindFirstChild("Weakest Dummy")
+		if dummy and dummy:FindFirstChild("HumanoidRootPart") then
+			local dhrp = dummy.HumanoidRootPart
+			local predicted, _ = predictPosition(dhrp, BASE_PREDICT * pa.predictMult + ping + 0.05, hrp)
+			local dist = (
+				Vector3.new(predicted.X, 0, predicted.Z)
+				- Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+			).Magnitude
+			if dist < best then
+				best    = dist
+				nearest = dhrp
+			end
+		end
+	end
+
+	return nearest
+end
+
+local function smoothCameraLook(target)
+	if not Camera or not target then return end
+	local camPos    = Camera.CFrame.Position
+	local targetPos = Vector3.new(
+		target.Position.X,
+		math.min(target.Position.Y, camPos.Y),
+		target.Position.Z
+	)
+	local direction = targetPos - camPos
+	if direction.Magnitude <= 0.001 then return end
+	local blended = Camera.CFrame.LookVector:Lerp(direction.Unit, CAMERA_SMOOTH)
+	Camera.CFrame = CFrame.lookAt(camPos, camPos + blended)
+end
+
+local function faceTowardEnemy(hrp, target, goRight)
+	local toEnemy = target.Position - hrp.Position
+	local flat = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+	if flat.Magnitude <= 0.01 then return end
+
+	local forward = flat.Unit
+	local right   = Vector3.new(-forward.Z, 0, forward.X)
+
+	local lookDir
+	if goRight then
+		lookDir = (forward + right * 0.85).Unit
+	else
+		lookDir = (forward - right * 0.85).Unit
+	end
+
+	hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + lookDir)
+end
+
+local function getGroundY(hrp, char)
+	local rp = RaycastParams.new()
+	rp.FilterDescendantsInstances = {char}
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local res = workspace:Raycast(hrp.Position, Vector3.new(0, -15, 0), rp)
+	return res and res.Position.Y or nil
+end
+
+local function calcSafeYVelocity(hrp, char, currentYVel)
+	local groundY = getGroundY(hrp, char)
+	if groundY then
+		local diff = (groundY + HOVER_HEIGHT) - hrp.Position.Y
+		if diff < 0 then
+			return math.clamp(diff * HOVER_PULL, -MAX_Y_VEL, 0)
+		else
+			return math.clamp(diff * 20, 0, MAX_Y_VEL)
+		end
+	end
+	return math.clamp(currentYVel - GRAVITY_STRENGTH * 0.016, -MAX_Y_VEL, 2)
+end
+
+local function getDynamicSpeed(dist, progress)
+	local alpha =
+		dist <= CLOSE_DIST
+		and 0
+		or math.clamp((dist - CLOSE_DIST) / 10, 0, 1)
+
+	local speed = CLOSE_SPEED + (BASE_SPEED - CLOSE_SPEED) * alpha
+
+	local rampUp    = math.clamp(progress / 0.08, 0, 1)
+	rampUp = rampUp * rampUp * (3 - 2 * rampUp)
+
+	local slowStart  = 0.82
+	local smoothSlow =
+		(1 - math.clamp((progress - slowStart) / (1 - slowStart), 0, 1)) ^ 0.72
+
+	speed = speed * rampUp * (0.18 + smoothSlow * 0.82)
+	return speed
+end
+
+local function softBrakeMultiplier(remainBudget)
+	if remainBudget >= SOFT_BRAKE_MARGIN then return 1.0 end
+	if remainBudget <= 0 then return 0.0 end
+	local t = remainBudget / SOFT_BRAKE_MARGIN
+	return t * t
+end
+
+local function doClick(char)
+	local args = {{ Goal = "LeftClick", Mobile = true }}
+	char:WaitForChild("Communicate"):FireServer(unpack(args))
+	local releaseArgs = {{ Goal = "LeftClickRelease", Mobile = true }}
+	char:WaitForChild("Communicate"):FireServer(unpack(releaseArgs))
+end
+
+local function executeDash(goRight, track)
+	if not enabled then return end
+	if isDashing or debounce then return end
+
+	local char = LP.Character
+	if not char then return end
+
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChild("Humanoid")
+	if not hrp or not hum then return end
+	if isDisabled(hum) then return end
+
+	local target = getNearest()
+	if not target then return end
+
+	local startTargetDistance = (
+		Vector3.new(target.Position.X, 0, target.Position.Z)
+		- Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+	).Magnitude
+
+	local currentDuration =
+		startTargetDistance > 23
+		and FAR_DURATION
+		or  CLOSE_DURATION
+
+	activeDashId += 1
+	local dashId = activeDashId
+
+	isDashing = true
+	debounce  = true
+
+	hum.AutoRotate = false
+	breakShiftLock()
+
+	local startPos = hrp.Position
+
+	local att = Instance.new("Attachment")
+	att.Parent = hrp
+
+	local lv = Instance.new("LinearVelocity")
+	lv.Attachment0            = att
+	lv.RelativeTo             = Enum.ActuatorRelativeTo.World
+	lv.MaxForce               = math.huge
+	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	lv.Parent                 = hrp
+
+	local clicked      = false
+	local clickStarted = false
+
+	local function totalDistance()
+		return (hrp.Position - startPos).Magnitude
+	end
+
+	local function cleanup()
+		if dashId ~= activeDashId then return end
+		activeDashId += 1
+		pcall(function() lv:Destroy()  end)
+		pcall(function() att:Destroy() end)
+		if hum.Parent then hum.AutoRotate = true end
+		isDashing = false
+		task.delay(0.08, function()
+			if dashId + 1 == activeDashId then
+				debounce = false
+			end
+		end)
+	end
+
+	local function shouldCancel()
+		if dashId ~= activeDashId then return true end
+		if not char.Parent         then return true end
+		if not hrp.Parent          then return true end
+		if not hum.Parent          then return true end
+		if isDisabled(hum)         then return true end
+		return false
+	end
+
+	local sideSign = goRight and -1 or 1
+
+	local velocity          = Vector3.zero
+	local trackedPrediction = target.Position
+	local smoothYVel        = hrp.AssemblyLinearVelocity.Y
+
+	local prevDesiredDir = Vector3.zero
+
+	local conn
+
+	conn = RunService.RenderStepped:Connect(function(dt)
+		if shouldCancel() then
+			conn:Disconnect()
+			cleanup()
+			return
+		end
+
+		if totalDistance() >= TOTAL_MAX_DISTANCE then
+			velocity = velocity:Lerp(Vector3.zero, math.clamp(dt * SMOOTH_STOP_RATE, 0, 1))
+			lv.VectorVelocity = Vector3.new(velocity.X, smoothYVel, velocity.Z)
+			conn:Disconnect()
+			cleanup()
+			return
+		end
+
+		hum.AutoRotate = false
+		breakShiftLock()
+		smoothCameraLook(target)
+
+		local traveled = (hrp.Position - startPos).Magnitude
+
+		if traveled >= DASH_DISTANCE then
+			conn:Disconnect()
+			return
+		end
+
+		local progress = math.clamp(traveled / DASH_DISTANCE, 0, 1)
+		local pa       = getPingAdaptive()
+
+		local rawPredicted, jerk, sideDash, backDash =
+			predictPosition(target, BASE_PREDICT * pa.predictMult + pa.pingSec, hrp)
+
+		local distToCurrent = (trackedPrediction - hrp.Position).Magnitude
+		local lerpSpeed
+
+		if jerk or sideDash then
+			lerpSpeed = JERK_LERP_BOOST
+		elseif distToCurrent < 8.0 then
+			lerpSpeed = NEAR_LERP_BOOST
+		else
+			lerpSpeed = FAR_LERP_BASE
+		end
+
+		trackedPrediction = trackedPrediction:Lerp(
+			rawPredicted,
+			math.clamp(dt * lerpSpeed, 0, 1)
+		)
+
+		local delta    = trackedPrediction - hrp.Position
+		local flat     = Vector3.new(delta.X, 0, delta.Z)
+		local dist     = flat.Magnitude
+
+		if dist <= 0.01 then return end
+
+		if dist <= CLICK_DISTANCE and not clickStarted then
+			clickStarted = true
+			local dynamicClickDelay = dist < 17 and 0.1 or 0.2
+			task.delay(dynamicClickDelay, function()
+				if clicked then return end
+				if shouldCancel() then return end
+
+				local pa2 = getPingAdaptive()
+				local latestPredicted, _ = predictPosition(target, BASE_PREDICT * pa2.predictMult + pa2.pingSec, hrp)
+				local latestDist = (
+					Vector3.new(latestPredicted.X, 0, latestPredicted.Z)
+					- Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+				).Magnitude
+
+				if latestDist <= CLICK_DISTANCE then
+					clicked = true
+					doClick(char)
+				end
+			end)
+		end
+
+		local dir  = flat.Unit
+		local side = Vector3.new(-dir.Z, 0, dir.X) * sideSign
+
+		local microCorr = Vector3.zero
+		if jerk then
+			microCorr = side * MICRO_CORR_JERK_OFFSET
+		end
+
+		local orbitForceMult = 1.0
+		if sideDash then
+			orbitForceMult = SIDE_DASH_ORBIT_BOOST
+		end
+
+		local orbitAlpha =
+			dist <= ORBIT_DISTANCE
+			and (1 - math.clamp(dist / ORBIT_DISTANCE, 0, 1))
+			or  0
+
+		local orbitSide  = side * ((REACH + 2.2) * orbitAlpha * pa.orbitForce * orbitForceMult)
+		local offset     = side * (REACH + pa.sideBoost + math.clamp(dist / 11, 0, 1.1)) + orbitSide
+		local backOffset = math.clamp(dist * 0.16, 0.7, 2)
+
+		if orbitAlpha > 0.15 then
+			backOffset *= (1 - orbitAlpha * 0.85)
+		end
+
+		if dist > FAR_APPROACH_DIST then
+			local farAlpha  = math.clamp((dist - FAR_APPROACH_DIST) / 8, 0, 1)
+			local farOffset = side * (FAR_SIDE_OFFSET * farAlpha)
+			backOffset = backOffset * (1 - farAlpha * 0.7)
+			offset = offset + farOffset
+		end
+
+		local finalXZ = trackedPrediction + offset - dir * backOffset + microCorr
+		local final   = Vector3.new(finalXZ.X, hrp.Position.Y, finalXZ.Z)
+		local move    = final - hrp.Position
+		local moveFlat = Vector3.new(move.X, 0, move.Z)
+
+		if moveFlat.Magnitude > 0.01 then
+			local speed = getDynamicSpeed(dist, progress)
+
+			local remain      = DASH_DISTANCE - traveled
+			local adaptiveCap = math.clamp((remain ^ 0.94) * 10.8, 86, BASE_SPEED + 18)
+			speed = math.min(speed, adaptiveCap)
+
+			local remainBudget = TOTAL_MAX_DISTANCE - totalDistance()
+			speed = speed * softBrakeMultiplier(remainBudget)
+
+			speed = math.min(speed, HARD_SPEED_CAP)
+
+			local desiredDir = moveFlat.Unit
+
+			if prevDesiredDir.Magnitude > 0.01 then
+				desiredDir = prevDesiredDir:Lerp(desiredDir, HOOKDASH_STAB_ALPHA)
+				if desiredDir.Magnitude > 0.001 then
+					desiredDir = desiredDir.Unit
+				end
+			end
+			prevDesiredDir = desiredDir
+
+			local myVel  = hrp.AssemblyLinearVelocity
+			local myFlat = Vector3.new(myVel.X, 0, myVel.Z)
+			local inertiaComp = Vector3.zero
+			if myFlat.Magnitude > 5 then
+				local inertiaErr = desiredDir - myFlat.Unit * myFlat:Dot(desiredDir) / (desiredDir.Magnitude * myFlat.Magnitude + 0.001)
+				inertiaComp = Vector3.new(inertiaErr.X, 0, inertiaErr.Z) * INERTIA_COMP_SCALE
+			end
+
+			local finalDesired = desiredDir + inertiaComp
+			if finalDesired.Magnitude > 0.001 then
+				finalDesired = finalDesired.Unit
+			end
+
+			local desired = finalDesired * speed
+
+			local velLerpAlpha = jerk and (dt * 28) or (dt * (21 - progress * 7))
+			velocity = velocity:Lerp(
+				Vector3.new(desired.X, 0, desired.Z),
+				math.clamp(velLerpAlpha, 0, 1)
+			)
+
+			local velMag = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+			if velMag > HARD_SPEED_CAP then
+				local scale = HARD_SPEED_CAP / velMag
+				velocity = Vector3.new(velocity.X * scale, velocity.Y, velocity.Z * scale)
+			end
+
+			local safeY = calcSafeYVelocity(hrp, char, smoothYVel)
+			smoothYVel  = smoothYVel + (safeY - smoothYVel) * math.clamp(dt * 14, 0, 1)
+			smoothYVel  = math.clamp(smoothYVel, -MAX_Y_VEL, MAX_Y_VEL)
+
+			lv.VectorVelocity = Vector3.new(velocity.X, smoothYVel, velocity.Z)
+			faceTowardEnemy(hrp, target, goRight)
+		end
+	end)
+
+	task.delay(currentDuration, function()
+		if conn then conn:Disconnect() end
+
+		local lookEnd  = tick() + POST_LOOK
+		local lookConn
+
+		lookConn = RunService.RenderStepped:Connect(function()
+			if shouldCancel() or tick() >= lookEnd then
+				lookConn:Disconnect()
+				return
+			end
+			smoothCameraLook(target)
+		end)
+
+		if not hrp.Parent then
+			cleanup()
+			return
+		end
+
+		local slideDir = Vector3.new(velocity.X, 0, velocity.Z)
+		if slideDir.Magnitude > 0.01 then
+			slideDir = slideDir.Unit
+		else
+			cleanup()
+			return
+		end
+
+		local slideMag = velocity.Magnitude
+		local slideVelXZ = Vector3.new(velocity.X, 0, velocity.Z)
+		local slowConn
+
+		slowConn = RunService.RenderStepped:Connect(function(dt)
+			if shouldCancel() then
+				slideVelXZ = slideVelXZ:Lerp(Vector3.zero, math.clamp(dt * SMOOTH_STOP_RATE, 0, 1))
+				lv.VectorVelocity = Vector3.new(slideVelXZ.X, smoothYVel, slideVelXZ.Z)
+				slowConn:Disconnect()
+				cleanup()
+				return
+			end
+
+			if totalDistance() >= TOTAL_MAX_DISTANCE then
+				slideVelXZ = slideVelXZ:Lerp(Vector3.zero, math.clamp(dt * SMOOTH_STOP_RATE, 0, 1))
+				lv.VectorVelocity = Vector3.new(slideVelXZ.X, smoothYVel, slideVelXZ.Z)
+				if slideVelXZ.Magnitude < 1 then
+					lv.VectorVelocity = Vector3.new(0, smoothYVel, 0)
+					slowConn:Disconnect()
+					cleanup()
+				end
+				return
+			end
+
+			if track and not track.IsPlaying then
+				slideVelXZ = slideVelXZ:Lerp(Vector3.zero, math.clamp(dt * SMOOTH_STOP_RATE, 0, 1))
+				lv.VectorVelocity = Vector3.new(slideVelXZ.X, smoothYVel, slideVelXZ.Z)
+				if slideVelXZ.Magnitude < 1 then
+					lv.VectorVelocity = Vector3.new(0, smoothYVel, 0)
+					slowConn:Disconnect()
+					cleanup()
+				end
+				return
+			end
+
+			hum.AutoRotate = false
+			breakShiftLock()
+			smoothCameraLook(target)
+
+			local pa = getPingAdaptive()
+			local predicted, _, sideDash2, _ = predictPosition(target, BASE_PREDICT * pa.predictMult + pa.pingSec, hrp)
+
+			local delta = predicted - hrp.Position
+			local flat  = Vector3.new(delta.X, 0, delta.Z)
+
+			if flat.Magnitude > 0.01 then
+				local dir  = flat.Unit
+				local side = Vector3.new(-dir.Z, 0, dir.X) * sideSign
+
+				local slideRotForce = sideDash2
+					and (SLIDE_ROTATE_FORCE * 14)
+					or  (SLIDE_ROTATE_FORCE * 10)
+
+				local curve = (dir + side * SLIDE_SIDE_CURVE).Unit
+				slideDir = slideDir:Lerp(
+					curve,
+					math.clamp(dt * slideRotForce, 0, 1)
+				)
+
+				faceTowardEnemy(hrp, target, goRight)
+			end
+
+			slideMag = math.max(slideMag - SLIDE_BRAKE * dt, SLIDE_MIN_SPEED)
+
+			local remainBudget2 = TOTAL_MAX_DISTANCE - totalDistance()
+			local brakeMult = softBrakeMultiplier(remainBudget2)
+			local effectiveMag = math.min(slideMag * brakeMult, HARD_SPEED_CAP)
+
+			local targetVelXZ = Vector3.new(slideDir.X * effectiveMag, 0, slideDir.Z * effectiveMag)
+			slideVelXZ = slideVelXZ:Lerp(targetVelXZ, math.clamp(dt * 14, 0, 1))
+
+			if effectiveMag <= SLIDE_STOP_SPEED or slideMag <= SLIDE_STOP_SPEED then
+				slideVelXZ = slideVelXZ:Lerp(Vector3.zero, math.clamp(dt * SMOOTH_STOP_RATE, 0, 1))
+				lv.VectorVelocity = Vector3.new(slideVelXZ.X, smoothYVel, slideVelXZ.Z)
+				if slideVelXZ.Magnitude < 0.8 then
+					lv.VectorVelocity = Vector3.new(0, smoothYVel, 0)
+					slowConn:Disconnect()
+					cleanup()
+				end
+				return
+			end
+
+			local safeY = calcSafeYVelocity(hrp, char, smoothYVel)
+			smoothYVel  = smoothYVel + (safeY - smoothYVel) * math.clamp(dt * 14, 0, 1)
+			smoothYVel  = math.clamp(smoothYVel, -MAX_Y_VEL, MAX_Y_VEL)
+
+			lv.VectorVelocity = Vector3.new(slideVelXZ.X, smoothYVel, slideVelXZ.Z)
+		end)
+	end)
+end
+
+local function setupCharacter(char)
+	if currentAnimConnection   then currentAnimConnection:Disconnect()   end
+	if currentRotateConnection then currentRotateConnection:Disconnect() end
+
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = hum
+	end
+
+	currentRotateConnection =
+		hum:GetPropertyChangedSignal("AutoRotate"):Connect(function()
+			if isDashing and hum.AutoRotate then
+				hum.AutoRotate = false
+			end
+		end)
+
+	currentAnimConnection =
+		animator.AnimationPlayed:Connect(function(track)
+			local anim = track.Animation
+			if not anim then return end
+
+			local id  = anim.AnimationId
+			local now = tick()
+
+			if id == lastAnimId and now - lastAnimTime < 0.2 then return end
+
+			lastAnimId   = id
+			lastAnimTime = now
+
+			if id == ANIM_LEFT then
+				executeDash(false, track)
+			elseif id == ANIM_RIGHT then
+				executeDash(true, track)
+			end
+		end)
+end
+
+if LP.Character then
+	task.spawn(function()
+		setupCharacter(LP.Character)
+	end)
+end
+
+LP.CharacterAdded:Connect(function(char)
+	isDashing   = false
+	debounce    = false
+	activeTrack = nil
+	activeDashId += 1
+
+	velocityHistories = {}
+
+	task.wait(1)
+	setupCharacter(char)
+end)
+
+game:GetService("StarterGui"):SetCore("SendNotification", {
+	Title    = "Perfect Dash v3",
+	Text     = "Smart predict ON",
+	Duration = 5,
+})
